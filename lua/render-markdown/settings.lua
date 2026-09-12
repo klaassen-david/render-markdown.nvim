@@ -1662,6 +1662,7 @@ M.pipe_table.cell = {
     padded = 'padded',
     raw = 'raw',
     overlay = 'overlay',
+    wrapped = 'wrapped',
 }
 
 ---@enum render.md.table.Style
@@ -1688,6 +1689,7 @@ M.pipe_table.default = {
     -- | raw     | replaces only the '|' characters in each row, leaving the cells unmodified |
     -- | padded  | raw + cells are padded to maximum visual width for each column             |
     -- | trimmed | padded except empty space is subtracted from visual width calculation      |
+    -- | wrapped | columns sized to the window, cell contents wrapped over several lines      |
     cell = 'padded',
     -- Adjust the computed width of table cells using custom logic.
     cell_offset = function()
@@ -1697,6 +1699,12 @@ M.pipe_table.default = {
     padding = 1,
     -- Minimum column width to use for padded or trimmed cell.
     min_width = 0,
+    -- Used by 'cell = wrapped'. Keeps the cursor within the window while a row
+    -- is rendered: the row is concealed, so a column past the edge cannot be
+    -- seen, but neovim still scrolls the window horizontally to reach it,
+    -- taking every other line on screen with it. Editing modes are not
+    -- rendered, so this never restricts editing.
+    clamp_cursor = true,
     -- Characters used to replace table border.
     -- Correspond to top(3), delimiter(3), bottom(3), vertical, & horizontal.
     -- stylua: ignore
@@ -1732,6 +1740,7 @@ function M.pipe_table.schema()
         cell_offset = { type = 'function' },
         padding = { type = 'number' },
         min_width = { type = 'number' },
+        clamp_cursor = { type = 'boolean' },
         border = { list = { type = 'string' } },
         border_enabled = { type = 'boolean' },
         border_virtual = { type = 'boolean' },
@@ -1797,11 +1806,19 @@ M.render = {}
 
 ---@class (exact) render.md.render.Config
 ---@field diff boolean
+---@field scrolled boolean
 
 ---@type render.md.render.Config
 M.render.default = {
     -- Whether to render when window is in diff-mode.
     diff = false,
+    -- Whether to render when the window is scrolled horizontally. Virtual text
+    -- is positioned by buffer column, so it moves out of view with the text it
+    -- replaces. Worth turning on when the rendered text is concealed, since
+    -- then there is nothing to scroll: 'pipe_table.cell = wrapped' being the
+    -- case that needs it, as revealing a wide row under the cursor scrolls the
+    -- window and would otherwise clear the whole buffer.
+    scrolled = false,
 }
 
 ---@return render.md.Schema
@@ -1810,6 +1827,7 @@ function M.render.schema()
     return {
         record = {
             diff = { type = 'boolean' },
+            scrolled = { type = 'boolean' },
         },
     }
 end

@@ -145,6 +145,18 @@ function M.resolve_config(user)
     if config.indent.enabled then
         config.pipe_table.border_virtual = true
     end
+    if config.pipe_table.cell == 'wrapped' then
+        -- a concealed line still wraps by the width of the text it hides, which
+        -- would put a blank screen row inside every row wider than the window
+        if not user.win_options or user.win_options.wrap == nil then
+            config.win_options.wrap = { default = vim.o.wrap, rendered = false }
+        end
+        -- and with wrapping off, a row under the cursor scrolls the window,
+        -- which would otherwise clear the whole buffer each time
+        if not user.render or user.render.scrolled == nil then
+            config.render.scrolled = true
+        end
+    end
     -- override settings incompatible with neovim version with compatible alternatives
     local compat = require('render-markdown.lib.compat')
     if config.code.border == 'hide' and not compat.has_11 then

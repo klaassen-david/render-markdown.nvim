@@ -10,6 +10,21 @@ local M = {}
 
 M.ns = vim.api.nvim_create_namespace('render-markdown.nvim')
 
+---cursor row per buffer as of the last parse
+---@type table<integer, integer>
+M.parsed = {}
+
+---@param buf integer
+---@param row? integer
+---@return boolean
+function M.table_row(buf, row)
+    if not row then
+        return false
+    end
+    local line = vim.api.nvim_buf_get_lines(buf, row, row + 1, false)[1]
+    return line ~= nil and line:match('^%s*|') ~= nil
+end
+
 ---@private
 ---@type table<integer, render.md.Decorator>
 M.cache = {}
@@ -87,6 +102,26 @@ function Updater:changed()
     return self.force
         or self.decorator:changed()
         or not Context.contains(self.buf, self.win)
+        or self:moved()
+end
+
+---A wrapped table row shows its source while the cursor is on it, so its marks
+---depend on the cursor row and not only on the buffer and the visible range.
+---@private
+---@return boolean
+function Updater:moved()
+    if self.config.pipe_table.cell ~= 'wrapped' then
+        return false
+    end
+    -- no state change: changed() runs twice per update, once to schedule and
+    -- once to decide on a re-parse
+    local row = env.row.get(self.buf, self.win)
+    local was = M.parsed[self.buf]
+    if row == was then
+        return false
+    end
+    -- only when a table row is involved, moving through prose changes nothing
+    return M.table_row(self.buf, row) or M.table_row(self.buf, was)
 end
 
 ---@private
@@ -97,7 +132,7 @@ function Updater:run()
     self.mode = env.mode.get() -- mode is only available after this point
     local render = self.config.enabled
         and self.config.resolved:render(self.mode)
-        and env.win.view(self.win).leftcol == 0
+        and (self.config.render.scrolled or env.win.view(self.win).leftcol == 0)
         and (self.config.render.diff or not env.win.get(self.win, 'diff'))
     log.buf('info', 'Render', self.buf, render)
     local next_state = render and 'rendered' or 'default'
@@ -147,6 +182,7 @@ end
 ---@private
 ---@param callback fun(extmarks: render.md.Extmark[]|nil)
 function Updater:parse(callback)
+    M.parsed[self.buf] = env.row.get(self.buf, self.win)
     local ok, parser = pcall(vim.treesitter.get_parser, self.buf)
     if ok and parser then
         -- reset buffer context
@@ -180,7 +216,43 @@ function Updater:display()
             extmark:show(M.ns, self.buf)
         end
     end
+    self:clamp()
     state.on.render({ buf = self.buf, win = self.win })
+end
+
+---A wrapped row shows its whole source while the cursor is on it, the tail on
+---virtual lines below. A column past the window edge therefore has nothing to
+---reveal, and reaching it would scroll the window horizontally, taking every
+---other line on screen with it. Hold the cursor at the edge instead.
+---@private
+function Updater:clamp()
+    local config = self.config.pipe_table
+    if config.cell ~= 'wrapped' or not config.clamp_cursor then
+        return
+    end
+    if self.win ~= vim.api.nvim_get_current_win() then
+        return
+    end
+    -- editing needs the cursor exactly where it was put
+    if vim.startswith(self.mode, 'i') or vim.startswith(self.mode, 'R') then
+        return
+    end
+    local row = env.row.get(self.buf, self.win)
+    if not row then
+        return
+    end
+    local width = env.win.width(self.win)
+    if vim.fn.virtcol('.') <= width then
+        return
+    end
+    -- only on a table row, never on long prose
+    if not M.table_row(self.buf, row) then
+        return
+    end
+    local col = vim.fn.virtcol2col(self.win, row + 1, width)
+    vim.api.nvim_win_set_cursor(self.win, { row + 1, math.max(col - 1, 0) })
+    -- neovim scrolls to reach a column but not back once it fits again
+    vim.fn.winrestview({ leftcol = 0 })
 end
 
 ---@private

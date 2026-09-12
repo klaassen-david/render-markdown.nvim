@@ -1,7 +1,35 @@
 local Base = require('render-markdown.render.base')
+local env = require('render-markdown.lib.env')
 local iter = require('render-markdown.lib.iter')
 local log = require('render-markdown.core.log')
 local str = require('render-markdown.lib.str')
+
+---Greedy wrap on whitespace, hard breaking words wider than the column.
+---@param text string
+---@param width integer
+---@return string[]
+local function wrap(text, width)
+    local lines, current = {}, ''
+    for word in text:gmatch('%S+') do
+        local candidate = current == '' and word or (current .. ' ' .. word)
+        if str.width(candidate) <= width then
+            current = candidate
+        else
+            if current ~= '' then
+                lines[#lines + 1] = current
+            end
+            current = word
+            while str.width(current) > width do
+                lines[#lines + 1] = str.sub(current, 1, width)
+                current = str.sub(current, width + 1, str.width(current))
+            end
+        end
+    end
+    if current ~= '' then
+        lines[#lines + 1] = current
+    end
+    return #lines > 0 and lines or { '' }
+end
 
 ---@class render.md.table.Data
 ---@field layout render.md.table.Layout
@@ -120,9 +148,52 @@ function Render:setup()
         end
     end
 
+    if self.config.cell == 'wrapped' then
+        self:fit(cols, rows)
+    end
+
     self.data = { layout = layout, delim = delim, cols = cols, rows = rows }
 
     return true
+end
+
+---Size columns to the window: natural content widths, then shave the widest
+---until a row fits. Stored widths include padding, as in every other mode.
+---@private
+---@param cols render.md.table.Col[]
+---@param rows render.md.table.Row[]
+function Render:fit(cols, rows)
+    local padding = 2 * self.config.padding
+    local minimum = math.max(self.config.min_width, 3)
+    local total = 0
+    for i, col in ipairs(cols) do
+        col.width = minimum
+        for _, row in ipairs(rows) do
+            col.width =
+                math.max(col.width, str.width(vim.trim(row.cells[i].node.text)))
+        end
+        total = total + col.width
+    end
+    local budget = env.win.width(self.context.win)
+        - (#cols + 1)
+        - (#cols * padding)
+    while total > budget do
+        local widest = nil ---@type render.md.table.Col?
+        for _, col in ipairs(cols) do
+            if
+                col.width > minimum and (not widest or col.width > widest.width)
+            then
+                widest = col
+            end
+        end
+        if not widest then
+            break
+        end
+        widest.width, total = widest.width - 1, total - 1
+    end
+    for _, col in ipairs(cols) do
+        col.width = col.width + padding
+    end
 end
 
 ---@private
@@ -270,7 +341,10 @@ function Render:delimiter()
     line:pad(str.spaces('start', delim.text))
     line:text(delimiter, self.config.head)
     line:pad(str.width(delim.text) - line:width())
-    self.marks:over(self.config, 'table_border', delim, {
+    if self.config.cell == 'wrapped' then
+        self.marks:over(self.config, false, delim, { conceal = '' })
+    end
+    self.marks:over(self.config, self:element('table_border'), delim, {
         virt_text = line:get(),
         virt_text_pos = 'overlay',
     })
@@ -330,7 +404,153 @@ function Render:row(row)
             virt_text = { { row.node.text:gsub('|', icon), highlight } },
             virt_text_pos = 'overlay',
         })
+    elseif self.config.cell == 'wrapped' then
+        self:wrapped(row, highlight)
     end
+end
+
+---Replace the row with a grid of its wrapped cells: the source text is
+---concealed, the first rendered line goes over it, the rest below as virtual
+---lines. Motions still see one line per row.
+---@private
+---@param row render.md.table.Row
+---@param highlight string
+function Render:wrapped(row, highlight)
+    if not self.context.conceal:enabled() then
+        return
+    end
+    local cols = self.data.cols
+    local padding = self.config.padding
+    local icon = self.config.border[10]
+
+    local cells, height = {}, 1
+    for i, cell in ipairs(row.cells) do
+        cells[i] = wrap(vim.trim(cell.node.text), cols[i].width - (2 * padding))
+        height = math.max(height, #cells[i])
+    end
+
+    local lines = {} ---@type render.md.Line[]
+    for h = 1, height do
+        local line = self:line():text(icon, highlight)
+        for i, col in ipairs(cols) do
+            local text = cells[i][h] or ''
+            local fill = col.width - (2 * padding) - str.width(text)
+            local left = 0
+            if col.alignment == Alignment.right then
+                left = fill
+            elseif col.alignment == Alignment.center then
+                left = math.floor(fill / 2)
+            end
+            line:pad(padding + left)
+            line:text(text, highlight)
+            line:pad(padding + fill - left)
+            line:text(icon, highlight)
+        end
+        lines[h] = line
+    end
+
+    if
+        env.row.get(self.context.buf, self.context.win) == row.node.start_row
+    then
+        self:source(row, height)
+    else
+        self:place(row, lines)
+    end
+end
+
+---The row under the cursor keeps its source on screen: the real line is left
+---alone, so it carries its own highlighting and a cursor that sits where it
+---actually is, and whatever runs past the window edge is continued below as
+---virtual lines. The block is padded to the height the rendered row would have
+---taken, so hovering a row never moves the rows around it.
+---@private
+---@param row render.md.table.Row
+---@param height integer
+function Render:source(row, height)
+    local width = env.win.width(self.context.win)
+    local text = row.node.text
+    local total = str.width(text)
+    local rest = {} ---@type render.md.mark.Line[]
+    local col = width + 1
+    while col <= total do
+        local chunk = str.sub(text, col, col + width - 1)
+        local line = self:line():text(chunk, self.config.row)
+        rest[#rest + 1] = self:indent():line(true):extend(line):get()
+        col = col + width
+    end
+    while #rest < height - 1 do
+        rest[#rest + 1] = self:indent():line(true):pad(1):get()
+    end
+    self:separator(row, rest)
+    if #rest > 0 then
+        self.marks:add(self.config, false, row.node.start_row, 0, {
+            virt_lines = rest,
+        })
+    end
+end
+
+---Conceal the source row, put the first rendered line over it and the rest
+---below as virtual lines, keeping the grid around it intact.
+---@private
+---@param row render.md.table.Row
+---@param lines render.md.Line[]
+function Render:place(row, lines)
+    self.marks:over(self.config, false, row.node, { conceal = '' })
+    self.marks:over(self.config, false, row.node, {
+        virt_text = lines[1]:get(),
+        virt_text_pos = 'overlay',
+    })
+
+    local rest = {} ---@type render.md.mark.Line[]
+    for h = 2, #lines do
+        rest[#rest + 1] = self:indent():line(true):extend(lines[h]):get()
+    end
+    self:separator(row, rest)
+    if #rest > 0 then
+        self.marks:add(self.config, false, row.node.start_row, 0, {
+            virt_lines = rest,
+        })
+    end
+end
+
+---Wrapped mode draws the source of the row under the cursor itself, so none of
+---its marks should be hidden by anti-conceal.
+---@private
+---@param element render.md.Element
+---@return render.md.mark.Conceal
+function Render:element(element)
+    if self.config.cell == 'wrapped' then
+        return false
+    end
+    return element
+end
+
+---The delimiter row already separates the header, the bottom border closes the
+---last row.
+---@private
+---@param row render.md.table.Row
+---@param rest render.md.mark.Line[]
+function Render:separator(row, rest)
+    local rows = self.data.rows
+    local skip = row.node.type == 'pipe_table_header' or rows[#rows] == row
+    if not self.config.border_enabled or skip then
+        return
+    end
+    local border = self.config.border
+    local separator = self:grid({ border[4], border[5], border[6] })
+    rest[#rest + 1] = self:indent():line(true):extend(separator):get()
+end
+
+---@private
+---@param chars [string, string, string]
+---@return render.md.Line
+function Render:grid(chars)
+    local icon = self.config.border[11]
+    local parts = iter.list.map(self.data.cols, function(col)
+        return icon:rep(col.width)
+    end)
+    local text = chars[1] .. table.concat(parts, chars[2]) .. chars[3]
+    return self:line():text(text, self.config.row)
 end
 
 ---Use low priority to include pipe marks
@@ -364,7 +584,12 @@ function Render:border()
     ---@param row render.md.table.Row
     ---@return boolean
     local function width_equal(row)
-        if vim.tbl_contains({ 'trimmed', 'padded' }, self.config.cell) then
+        if
+            vim.tbl_contains(
+                { 'trimmed', 'padded', 'wrapped' },
+                self.config.cell
+            )
+        then
             -- assume table was modified to match
             return true
         elseif self.config.cell == 'raw' then
@@ -407,15 +632,21 @@ function Render:border()
         local available = target and str.width(target) == 0
 
         if not virtual and available and self.context.used:take(row) then
-            self.marks:add(self.config, 'table_border', row, 0, {
+            self.marks:add(self.config, self:element('table_border'), row, 0, {
                 virt_text = line:get(),
                 virt_text_pos = 'overlay',
             })
         else
-            self.marks:add(self.config, 'virtual_lines', node.start_row, 0, {
-                virt_lines = { self:indent():line(true):extend(line):get() },
-                virt_lines_above = above,
-            })
+            self.marks:add(
+                self.config,
+                self:element('virtual_lines'),
+                node.start_row,
+                0,
+                {
+                    virt_lines = { self:indent():line(true):extend(line):get() },
+                    virt_lines_above = above,
+                }
+            )
         end
     end
 
