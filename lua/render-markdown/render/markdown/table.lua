@@ -1,6 +1,7 @@
 local Base = require('render-markdown.render.base')
 local env = require('render-markdown.lib.env')
 local iter = require('render-markdown.lib.iter')
+local list = require('render-markdown.lib.list')
 local log = require('render-markdown.core.log')
 local str = require('render-markdown.lib.str')
 
@@ -149,7 +150,7 @@ function Render:setup()
     end
 
     if self.config.cell == 'wrapped' then
-        self:fit(cols, rows)
+        self:fit(cols, rows, layout.col)
     end
 
     self.data = { layout = layout, delim = delim, cols = cols, rows = rows }
@@ -162,7 +163,8 @@ end
 ---@private
 ---@param cols render.md.table.Col[]
 ---@param rows render.md.table.Row[]
-function Render:fit(cols, rows)
+---@param offset integer column the table starts at, which is not always zero
+function Render:fit(cols, rows, offset)
     local padding = 2 * self.config.padding
     local minimum = math.max(self.config.min_width, 3)
     local total = 0
@@ -174,9 +176,8 @@ function Render:fit(cols, rows)
         end
         total = total + col.width
     end
-    local budget = env.win.width(self.context.win)
-        - (#cols + 1)
-        - (#cols * padding)
+    local width = env.win.width(self.context.win) - offset
+    local budget = width - (#cols + 1) - (#cols * padding)
     while total > budget do
         local widest = nil ---@type render.md.table.Col?
         for _, col in ipairs(cols) do
@@ -467,7 +468,7 @@ end
 ---@param row render.md.table.Row
 ---@param height integer
 function Render:source(row, height)
-    local width = env.win.width(self.context.win)
+    local width = self:available()
     local text = row.node.text
     local total = str.width(text)
     local rest = {} ---@type render.md.mark.Line[]
@@ -475,11 +476,11 @@ function Render:source(row, height)
     while col <= total do
         local chunk = str.sub(text, col, col + width - 1)
         local line = self:line():text(chunk, self.config.row)
-        rest[#rest + 1] = self:indent():line(true):extend(line):get()
+        rest[#rest + 1] = self:virtual():extend(line):get()
         col = col + width
     end
     while #rest < height - 1 do
-        rest[#rest + 1] = self:indent():line(true):pad(1):get()
+        rest[#rest + 1] = self:virtual():pad(1):get()
     end
     self:separator(row, rest)
     if #rest > 0 then
@@ -503,7 +504,7 @@ function Render:place(row, lines)
 
     local rest = {} ---@type render.md.mark.Line[]
     for h = 2, #lines do
-        rest[#rest + 1] = self:indent():line(true):extend(lines[h]):get()
+        rest[#rest + 1] = self:virtual():extend(lines[h]):get()
     end
     self:separator(row, rest)
     if #rest > 0 then
@@ -511,6 +512,48 @@ function Render:place(row, lines)
             virt_lines = rest,
         })
     end
+end
+
+---Width the table itself can use: the window less whatever it is nested in.
+---@private
+---@return integer
+function Render:available()
+    return env.win.width(self.context.win) - self.data.layout.col
+end
+
+---A virtual line starts at the window edge, so it has to carry what the rows
+---get from the buffer: the block quote markers of the lines it sits between,
+---drawn as the quote module draws them, and padding for anything else.
+---@private
+---@return render.md.Line
+function Render:virtual()
+    local line = self:indent():line(true)
+    local col = self.data.layout.col
+    if col == 0 then
+        return line
+    end
+    local quote = self.context.config.quote
+    local row = self.node.start_row
+    local text = vim.api.nvim_buf_get_lines(
+        self.context.buf,
+        row,
+        row + 1,
+        false
+    )[1] or ''
+    local level = 0
+    for i = 1, col do
+        local icon = nil ---@type string?
+        if text:sub(i, i) == '>' and quote.enabled then
+            level = level + 1
+            icon = list.cycle(quote.icon, level)
+        end
+        if icon and str.width(icon) == 1 then
+            line:text(icon, list.cycle(quote.highlight, level))
+        else
+            line:pad(1)
+        end
+    end
+    return line
 end
 
 ---Wrapped mode draws the source of the row under the cursor itself, so none of
@@ -525,20 +568,27 @@ function Render:element(element)
     return element
 end
 
----The delimiter row already separates the header, the bottom border closes the
----last row.
+---Close the row: the delimiter row already separates the header, the last row
+---takes the bottom border. Both belong to the row's own mark, two virtual line
+---marks on one row are not drawn in the order they were added.
 ---@private
 ---@param row render.md.table.Row
 ---@param rest render.md.mark.Line[]
 function Render:separator(row, rest)
     local rows = self.data.rows
-    local skip = row.node.type == 'pipe_table_header' or rows[#rows] == row
-    if not self.config.border_enabled or skip then
+    if not self.config.border_enabled then
         return
     end
     local border = self.config.border
-    local separator = self:grid({ border[4], border[5], border[6] })
-    rest[#rest + 1] = self:indent():line(true):extend(separator):get()
+    local chars = nil ---@type [string, string, string]?
+    if rows[#rows] == row then
+        chars = { border[7], border[8], border[9] }
+    elseif row.node.type ~= 'pipe_table_header' then
+        chars = { border[4], border[5], border[6] }
+    end
+    if chars then
+        rest[#rest + 1] = self:virtual():extend(self:grid(chars)):get()
+    end
 end
 
 ---@private
@@ -625,25 +675,27 @@ function Render:border()
     local function table_border(node, above, chars)
         local text = chars[1] .. table.concat(parts, chars[2]) .. chars[3]
         local highlight = above and self.config.head or self.config.row
-        local line = self:line():pad(self.data.layout.col):text(text, highlight)
 
         local virtual = self.config.border_virtual
         local row, target = node:line(above and 'above' or 'below', 1)
         local available = target and str.width(target) == 0
 
         if not virtual and available and self.context.used:take(row) then
+            -- drawn over a real line, which carries its own prefix
+            local line = self:line():pad(self.data.layout.col)
             self.marks:add(self.config, self:element('table_border'), row, 0, {
-                virt_text = line:get(),
+                virt_text = line:text(text, highlight):get(),
                 virt_text_pos = 'overlay',
             })
         else
+            local line = self:virtual():text(text, highlight)
             self.marks:add(
                 self.config,
                 self:element('virtual_lines'),
                 node.start_row,
                 0,
                 {
-                    virt_lines = { self:indent():line(true):extend(line):get() },
+                    virt_lines = { line:get() },
                     virt_lines_above = above,
                 }
             )
@@ -651,7 +703,7 @@ function Render:border()
     end
 
     table_border(first.node, true, { border[1], border[2], border[3] })
-    if #rows > 1 then
+    if #rows > 1 and self.config.cell ~= 'wrapped' then
         table_border(last.node, false, { border[7], border[8], border[9] })
     end
 end

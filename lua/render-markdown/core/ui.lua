@@ -22,7 +22,8 @@ function M.table_row(buf, row)
         return false
     end
     local line = vim.api.nvim_buf_get_lines(buf, row, row + 1, false)[1]
-    return line ~= nil and line:match('^%s*|') ~= nil
+    -- block quote markers included, a quoted table is still a table
+    return line ~= nil and line:match('^[%s>]*|') ~= nil
 end
 
 ---@private
