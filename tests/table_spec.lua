@@ -240,7 +240,7 @@ describe('table', function()
         marks:add(row:get(1, 0), { 0, 39 }, {
             virt_text = {
                 {
-                    '│ Regular   │ [[行\\│link]]           │',
+                    '│ Regular   │ [[行\\|link]]           │',
                     'RmTableRow',
                 },
             },
@@ -270,7 +270,7 @@ describe('table', function()
             '├───────────┼───────────────────────━┤',
             '│ `Item 行` │ [link](https://行.com) │',
             '│ &lt;1&gt; │ ==Itém 2==             │',
-            '│ Regular   │ [[行\\│link]]           │',
+            '│ Regular   │ [[行\\|link]]           │',
             '└───────────┴────────────────────────┘',
             '┌───────────┬───────────┐',
             '│ Heading 1 │ Heading 2 │',

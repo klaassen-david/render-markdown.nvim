@@ -95,11 +95,25 @@ function Conceal:width(s, blocks)
     end
 end
 
+---Whether a column is already inside a concealed range, which can happen when
+---an inline element hides text that another one also wants to hide.
+---@param row integer
+---@param col integer
+---@return boolean
+function Conceal:covered(row, col)
+    for _, range in ipairs(self:line(row).ranges) do
+        if range[1] <= col and col < range[2] then
+            return true
+        end
+    end
+    return false
+end
+
 ---@param body render.md.node.Body
 ---@return boolean
 function Conceal:hidden(body)
     -- conceal lines metadata require neovim >= 0.11.0 to function
-    return compat.has_11 and self:line(body).hidden
+    return compat.has_11 and self:line(body.start_row).hidden
 end
 
 ---@param body render.md.node.Body
@@ -107,7 +121,7 @@ end
 function Conceal:get(body)
     local result = 0
     local target = { body.start_col, body.end_col } ---@type render.md.Range
-    for _, range in ipairs(self:line(body).ranges) do
+    for _, range in ipairs(self:line(body.start_row).ranges) do
         local overlap = interval.overlap(range, target, true)
         if overlap then
             local text = body.text:sub(
@@ -122,14 +136,14 @@ function Conceal:get(body)
 end
 
 ---@private
----@param body render.md.node.Body
+---@param row integer
 ---@return render.md.request.conceal.Line
-function Conceal:line(body)
+function Conceal:line(row)
     if not self.computed then
         self.computed = true
         self:compute()
     end
-    local line = self.lines[body.start_row]
+    local line = self.lines[row]
     if not line then
         line = { hidden = false, ranges = {} }
     end
@@ -170,29 +184,31 @@ function Conceal:tree(language, root)
     end
     self.view:query(root, query, function(id, node, data)
         if data.conceal_lines then
-            local row = Conceal.range(id, node, data)
+            local row = self:range(id, node, data)
             self:add(row, true)
         end
         if data.conceal then
-            local row, start_col, _, end_col = Conceal.range(id, node, data)
+            local row, start_col, _, end_col = self:range(id, node, data)
             self:add(row, { start_col, end_col, data.conceal, 1 })
         end
     end)
 end
 
+---Directives can move the range a capture applies to, either replacing it or
+---shifting its edges, such as concealing only the backslash of an escape.
 ---@private
 ---@param id integer
 ---@param node TSNode
 ---@param data vim.treesitter.query.TSMetadata
 ---@return integer, integer, integer, integer
-function Conceal.range(id, node, data)
-    local range = data.range
-    if range then
-        return range[1], range[2], range[3], range[4]
+function Conceal:range(id, node, data)
+    local metadata = data ---@type vim.treesitter.query.TSMetadata?
+    if not (data.range or data.offset) then
+        metadata = data[id]
     end
-    range = data[id] and data[id].range or nil
-    if range then
-        return range[1], range[2], range[3], range[4]
+    if metadata and (metadata.range or metadata.offset) then
+        local range = vim.treesitter.get_range(node, self.buf, metadata)
+        return range[1], range[2], range[4], range[5]
     end
     return node:range()
 end

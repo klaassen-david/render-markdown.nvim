@@ -32,6 +32,42 @@ local function wrap(text, width)
     return #lines > 0 and lines or { '' }
 end
 
+---Offsets of the backslash in each escaped pipe. Github strips it before the
+---cell is parsed, so the pipe renders as a single character, even inside a
+---code span. Scanning left to right without tracking earlier backslashes is
+---what github does with runs of them.
+---@param text string
+---@return integer[]
+local function escaped(text)
+    local result = {} ---@type integer[]
+    local at = 1
+    while true do
+        local i = text:find('\\|', at, true)
+        if not i then
+            return result
+        end
+        result[#result + 1] = i
+        at = i + 2
+    end
+end
+
+---@param text string
+---@return string
+local function unescape(text)
+    return (text:gsub('\\|', '|'))
+end
+
+---Replace the pipes that delimit cells, leaving the escaped ones alone.
+---@param text string
+---@param icon string
+---@return string
+local function borders(text, icon)
+    local result = text:gsub('\\?|', function(match)
+        return #match == 2 and match or icon
+    end)
+    return result
+end
+
 ---@class render.md.table.Data
 ---@field layout render.md.table.Layout
 ---@field delim render.md.Node
@@ -63,6 +99,7 @@ local Alignment = {
 ---@field node render.md.Node
 ---@field width integer
 ---@field space render.md.table.cell.Space
+---@field escapes integer[] columns of the backslash in each escaped pipe
 
 ---@class render.md.table.cell.Space
 ---@field left integer
@@ -171,8 +208,8 @@ function Render:fit(cols, rows, offset)
     for i, col in ipairs(cols) do
         col.width = minimum
         for _, row in ipairs(rows) do
-            col.width =
-                math.max(col.width, str.width(vim.trim(row.cells[i].node.text)))
+            local text = unescape(vim.trim(row.cells[i].node.text))
+            col.width = math.max(col.width, str.width(text))
         end
         total = total + col.width
     end
@@ -255,14 +292,24 @@ function Render:parse_row(node, num_cols)
         -- account for double width glyphs by replacing cell range with width
         local start_col = parts.pipes[i].end_col
         local end_col = parts.pipes[i + 1].start_col
+        local escapes = {} ---@type integer[]
+        for _, offset in ipairs(escaped(cell.text)) do
+            local escape = cell.start_col + offset - 1
+            -- an inline element may already hide it, such as a wiki link alias
+            if not self.context.conceal:covered(cell.start_row, escape) then
+                escapes[#escapes + 1] = escape
+            end
+        end
         local width = (end_col - start_col)
             - (cell.end_col - cell.start_col)
             + self.context:width(cell)
+            - (#escapes * self:escape_width())
             + self.config.cell_offset({ node = cell:get() })
         assert(width >= 0, 'invalid table layout')
         cells[#cells + 1] = {
             node = cell,
             width = width,
+            escapes = escapes,
             space = {
                 -- gap between the cell start and the pipe start
                 left = math.max(cell.start_col - start_col, 0),
@@ -273,6 +320,26 @@ function Render:parse_row(node, num_cols)
     end
     ---@type render.md.table.Row
     return { node = node, pipes = parts.pipes, cells = cells }
+end
+
+---Only the modes that modify cells hide escapes: elsewhere the alignment of
+---the source is what gets rendered, so removing a character would break it.
+---@private
+---@return boolean
+function Render:hides_escapes()
+    return self.context.conceal:enabled()
+        and vim.tbl_contains({ 'trimmed', 'padded' }, self.config.cell)
+end
+
+---Columns each escaped pipe loses: the backslash is concealed, the pipe it
+---escapes is kept.
+---@private
+---@return integer
+function Render:escape_width()
+    if not self:hides_escapes() then
+        return 0
+    end
+    return 1 - self.context.conceal:width('', 1)
 end
 
 ---@private
@@ -369,6 +436,7 @@ function Render:row(row)
 
     if vim.tbl_contains({ 'trimmed', 'padded' }, self.config.cell) then
         for i, cell in ipairs(row.cells) do
+            self:escape(cell)
             local col = self.data.cols[i]
             local node = cell.node
             local space = cell.space
@@ -402,11 +470,27 @@ function Render:row(row)
         end
     elseif self.config.cell == 'overlay' then
         self.marks:over(self.config, 'table_border', row.node, {
-            virt_text = { { row.node.text:gsub('|', icon), highlight } },
+            virt_text = { { borders(row.node.text, icon), highlight } },
             virt_text_pos = 'overlay',
         })
     elseif self.config.cell == 'wrapped' then
         self:wrapped(row, highlight)
+    end
+end
+
+---Hide the backslash of each escaped pipe, leaving the pipe itself, which is
+---the single character github renders for it.
+---@private
+---@param cell render.md.table.row.Cell
+function Render:escape(cell)
+    if not self:hides_escapes() then
+        return
+    end
+    for _, col in ipairs(cell.escapes) do
+        self.marks:add(self.config, true, cell.node.start_row, col, {
+            end_col = col + 1,
+            conceal = '',
+        })
     end
 end
 
@@ -426,7 +510,8 @@ function Render:wrapped(row, highlight)
 
     local cells, height = {}, 1
     for i, cell in ipairs(row.cells) do
-        cells[i] = wrap(vim.trim(cell.node.text), cols[i].width - (2 * padding))
+        local text = unescape(vim.trim(cell.node.text))
+        cells[i] = wrap(text, cols[i].width - (2 * padding))
         height = math.max(height, #cells[i])
     end
 
